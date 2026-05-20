@@ -1,5 +1,6 @@
 
 import io
+import re
 import pandas as pd
 import streamlit as st
 
@@ -13,7 +14,6 @@ st.caption(
 
 
 def load_workbook(file_obj):
-    """Return a dict of sheet_name -> DataFrame."""
     xls = pd.ExcelFile(file_obj, engine="openpyxl")
     sheets = {}
     for s in xls.sheet_names:
@@ -36,19 +36,12 @@ def column_presence_map(selected_sources, selected_columns_map):
 
 
 def get_safe_source_column_name(selected_sources, selected_columns_map):
-    """Pick a metadata column name that won't clash with user data."""
     used_columns = set()
     for source in selected_sources:
         used_columns.update(selected_columns_map.get(source["label"], []))
         used_columns.update([str(c).strip() for c in source["df"].columns])
 
-    candidates = [
-        "Source",
-        "Source_Sheet",
-        "__Source__",
-        "__Source_Sheet__",
-        "_Merged_Source_",
-    ]
+    candidates = ["Source", "Source_Sheet", "__Source__", "__Source_Sheet__", "_Merged_Source_"]
     for candidate in candidates:
         if candidate not in used_columns:
             return candidate
@@ -61,8 +54,7 @@ def get_safe_source_column_name(selected_sources, selected_columns_map):
         i += 1
 
 
-def build_merged_dataframe(selected_sources, selected_columns_map, source_column_name):
-    """Concatenate selected sheets after aligning selected columns."""
+def build_appended_dataframe(selected_sources, selected_columns_map, source_column_name):
     union_cols = list(dict.fromkeys(
         [col for source in selected_sources for col in selected_columns_map[source["label"]]]
     ))
@@ -83,6 +75,43 @@ def build_merged_dataframe(selected_sources, selected_columns_map, source_column
     if merged_parts:
         return pd.concat(merged_parts, ignore_index=True)
     return pd.DataFrame(columns=[source_column_name] + union_cols)
+
+
+def sanitize_label(text):
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", text)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned[:40] if cleaned else "Sheet"
+
+
+def build_common_value_output(selected_sources, selected_columns_map, match_columns):
+    """
+    Show only rows where common key values are present across ALL selected sheets.
+    This performs an inner join using the selected common columns.
+    """
+    if len(selected_sources) < 2:
+        return pd.DataFrame()
+    if not match_columns:
+        return pd.DataFrame()
+
+    prepared = []
+    for source in selected_sources:
+        label = source["label"]
+        suffix = sanitize_label(label)
+        picked = selected_columns_map[label]
+        df = source["df"][picked].copy()
+
+        rename_map = {}
+        for col in df.columns:
+            if col not in match_columns:
+                rename_map[col] = f"{col}__{suffix}"
+        df = df.rename(columns=rename_map)
+        prepared.append(df)
+
+    result = prepared[0]
+    for next_df in prepared[1:]:
+        result = result.merge(next_df, on=match_columns, how="inner")
+
+    return result
 
 
 def as_excel_bytes(dfs_dict):
@@ -138,7 +167,6 @@ chosen_labels = st.multiselect(
     options=source_labels,
     default=default_labels
 )
-
 selected_sources = [s for s in all_sources if s["label"] in chosen_labels]
 
 if len(selected_sources) < 2:
@@ -160,7 +188,7 @@ for i, source in enumerate(selected_sources):
             key=f"cols_{source['label']}"
         )
         if not selected_cols:
-            st.error("Select at least one column.")
+            st.error("Select at least one column for each sheet.")
             st.stop()
         selected_columns_map[source["label"]] = selected_cols
         st.caption(f"Rows: {len(source['df'])} | Columns: {len(options)}")
@@ -177,20 +205,40 @@ only_in_others = sorted(others_union - first_set)
 
 presence_df = column_presence_map(selected_sources, selected_columns_map)
 source_column_name = get_safe_source_column_name(selected_sources, selected_columns_map)
-merged_df = build_merged_dataframe(selected_sources, selected_columns_map, source_column_name)
+appended_df = build_appended_dataframe(selected_sources, selected_columns_map, source_column_name)
 
-st.subheader("3) Results")
-metric_cols = st.columns(4)
+st.subheader("3) Show only outputs where common value is present")
+if common_cols:
+    default_match_cols = common_cols[:1]
+    match_columns = st.multiselect(
+        "Select the common column(s) to use for matching rows across sheets",
+        options=common_cols,
+        default=default_match_cols,
+        help="The tool will show only rows where the selected common key values exist in all selected sheets."
+    )
+else:
+    match_columns = []
+    st.warning("No common columns are available across the selected sheets. Row-level matching cannot be performed.")
+
+if match_columns:
+    common_value_df = build_common_value_output(selected_sources, selected_columns_map, match_columns)
+else:
+    common_value_df = pd.DataFrame()
+
+st.subheader("4) Results")
+metric_cols = st.columns(5)
 metric_cols[0].metric("Sheets selected", len(selected_sources))
 metric_cols[1].metric("Union columns", len(union_cols))
 metric_cols[2].metric("Common columns", len(common_cols))
-metric_cols[3].metric("Merged rows", len(merged_df))
+metric_cols[3].metric("Appended rows", len(appended_df))
+metric_cols[4].metric("Matched rows", len(common_value_df))
 
-result_tab1, result_tab2, result_tab3, result_tab4 = st.tabs([
+result_tab1, result_tab2, result_tab3, result_tab4, result_tab5 = st.tabs([
     "Union / Common",
     f"Only in {selected_sources[0]['sheet']}",
     "Presence Matrix",
-    "Merged Data",
+    "Matched Rows Only",
+    "Appended Output",
 ])
 
 with result_tab1:
@@ -216,19 +264,30 @@ with result_tab3:
     st.dataframe(presence_df, use_container_width=True)
 
 with result_tab4:
-    st.markdown("### Normalized Merged Output")
-    st.caption(
-        f"A safe metadata column named '{source_column_name}' is added to indicate the origin sheet. "
-        "This avoids clashes if your Excel file already contains a column named 'Source'."
-    )
-    st.dataframe(merged_df, use_container_width=True, height=450)
+    st.markdown("### Output where common value is present")
+    if match_columns:
+        st.caption(
+            "This table shows only rows where the selected key column values are present in all selected sheets "
+            f"(inner join on: {', '.join(match_columns)})."
+        )
+        st.dataframe(common_value_df, use_container_width=True, height=450)
+    else:
+        st.info("Select at least one common match column to see matched rows.")
 
-st.subheader("4) Download the output")
+with result_tab5:
+    st.markdown("### Full appended output")
+    st.caption(
+        f"A safe metadata column named '{source_column_name}' is added to indicate the origin sheet."
+    )
+    st.dataframe(appended_df, use_container_width=True, height=450)
+
+st.subheader("5) Download the output")
 output_book = {
     "Summary_Union": pd.DataFrame({"Union Columns": union_cols}),
     "Summary_Common": pd.DataFrame({"Common Columns": common_cols}),
     "Presence_Matrix": presence_df,
-    "Merged_Data": merged_df,
+    "Matched_Rows_Only": common_value_df,
+    "Appended_Output": appended_df,
 }
 excel_data = as_excel_bytes(output_book)
 
@@ -242,11 +301,11 @@ with c1:
         use_container_width=True,
     )
 with c2:
-    csv_data = merged_df.to_csv(index=False).encode("utf-8")
+    csv_data = common_value_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download Merged Data as CSV",
+        label="Download Matched Rows as CSV",
         data=csv_data,
-        file_name="merged_data.csv",
+        file_name="matched_rows_only.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -254,20 +313,14 @@ with c2:
 with st.expander("How this works"):
     st.markdown(
         """
-        - Upload one or more `.xlsx` files.
-        - Select the sheets you want to compare.
-        - Select the columns from each sheet.
-        - See the **union**, **common columns**, **presence matrix**, and **merged output**.
-        - Download the final output in Excel or CSV format.
+        - **Step 1:** Select the sheets you want to compare.
+        - **Step 2:** Select the columns you want from each sheet.
+        - **Step 3:** Select one or more **common columns** to use as matching keys.
+        - The app will then show **only the rows where the common key value exists in all selected sheets**.
 
         **Example:**
-        - Sheet 1: `A, B, C`
-        - Sheet 2: `B, C, D, E`
-
-        The tool can show:
-        - **Union:** `A, B, C, D, E`
-        - **Common:** `B, C`
-        - **Only in first sheet:** `A`
-        - **Merged output:** rows from both sheets aligned to the union of selected columns.
+        - Sheet 1 columns: `A, B, C`
+        - Sheet 2 columns: `B, C, D, E`
+        - If you choose `B` as the match key, the output will show only rows where the same `B` value is present in both sheets.
         """
     )
